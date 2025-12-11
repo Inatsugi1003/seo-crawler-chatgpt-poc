@@ -1,0 +1,9 @@
+# never commit secrets
+.env
+*.env
+.streamlit/secrets.toml
+
+# python/streamlit noise
+__pycache__/
+*.pyc
+*.DS_Store
