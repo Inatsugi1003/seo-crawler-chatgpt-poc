@@ -11,70 +11,6 @@ from llm import page_audit
 st.set_page_config(page_title="Site Crawl & Audit (Safe)", page_icon="🕸️")
 st.title("サイト自動クロール × ChatGPT分析（安全実装）")
 
-# ==== DIAG START (temporary) ====
-import os, httpx, streamlit as st
-from secure_openai_client import get_openai_api_key
-st.write("🔎 Running minimal auth diagnostic...")
-
-key = get_openai_api_key() or ""
-st.write("key startswith sk-:", key.startswith("sk-"))
-st.write("key length:", len(key))
-
-# 余計な改行や全角が紛れてないか（TrueならOK）
-is_ascii = all(ord(c) < 128 for c in key)
-st.write("key is ASCII only:", is_ascii)
-
-if not key:
-    st.error("キーが読み込まれていません。Secrets/環境変数を確認してください。")
-    st.stop()
-
-# ① まずは生HTTPで /v1/models を叩いて401かどうか確認（SDKよりも確実）
-try:
-    r = httpx.get(
-        "https://api.openai.com/v1/models",
-        headers={"Authorization": f"Bearer {key}"},
-        timeout=15,
-        follow_redirects=True,
-    )
-    st.write("GET /v1/models -> status_code:", r.status_code)
-    if r.status_code == 401:
-        st.error("401 Unauthorized：キーが無効/読めていない/プロジェクト紐付け不一致の可能性が高いです。")
-        st.stop()
-    elif r.status_code >= 400:
-        st.error(f"HTTPエラー: {r.status_code}. Cloudのネットワーク/一時障害の可能性。")
-        st.stop()
-except Exception as e:
-    st.error(f"HTTP層で例外発生: {e.__class__.__name__}")
-    st.stop()
-
-# ② SDKでも最小呼び出し（models.list → chatの順）
-from secure_openai_client import get_openai_client
-client = get_openai_client()
-
-ok1 = ok2 = False
-try:
-    _ = client.models.list()
-    ok1 = True
-    st.write("SDK models.list: OK")
-except Exception as e:
-    st.error(f"SDK models.list 失敗: {e.__class__.__name__}")
-    st.stop()
-
-try:
-    _ = client.chat.completions.create(
-        model="gpt-4o-mini", messages=[{"role": "user", "content": "ping"}], max_tokens=1, temperature=0
-    )
-    ok2 = True
-    st.write("SDK chat.completions: OK")
-except Exception as e:
-    st.error(f"SDK chat.completions 失敗: {e.__class__.__name__}")
-    st.info("→ モデル権限/組織ポリシー/プロジェクト紐付けが原因の可能性が高いです。")
-    st.stop()
-
-st.success("✅ 診断パス：通信・認証ともOK。以降の本処理へ進みます。")
-# ==== DIAG END (temporary) ====
-
-
 # ---------------------------
 # Helpers
 # ---------------------------
@@ -219,4 +155,5 @@ if start_btn:
         )
     else:
         st.info("結果はありません（対象ページが無い、または全てスキップされた可能性があります）。")
+
 
