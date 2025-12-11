@@ -1,0 +1,17 @@
+# =====================================
+# .pre-commit-config.yaml
+# -------------------------------------
+# コミット前にAPIキーなどの秘密情報が
+# 誤って含まれていないか自動チェックします。
+# -------------------------------------
+# 使い方：
+#   pip install pre-commit
+#   pre-commit install
+#   → 以降、git commit 時に自動検査されます。
+# =====================================
+
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
