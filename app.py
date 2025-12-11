@@ -181,7 +181,7 @@ async def crawl(seed, max_pages, max_depth, concurrency, delay_ms, ua, inc_pat, 
                     queue.task_done()
                     continue
 
-                soup = BeautifulSoup(html, "lxml")
+                soup = BeautifulSoup(html, "html.parser")
 
                 # robots meta
                 robots_meta = ""
@@ -404,3 +404,4 @@ if run:
 
     else:
         st.warning("有効なページを取得できませんでした。開始URL/robots/範囲設定をご確認ください。")
+
