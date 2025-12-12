@@ -1,4 +1,4 @@
-# app.py — crawl -> metrics -> LLM suggestions -> dashboard (secure edition)
+# app.py — crawl -> metrics -> LLM suggestions -> dashboard (secure + stats)
 import asyncio, json, io, csv
 import streamlit as st
 from secure_openai_client import get_openai_client
@@ -9,7 +9,6 @@ from llm import page_audit
 st.set_page_config(page_title="Site Crawl & Audit (Safe)", page_icon="🕸️")
 st.title("サイト自動クロール × ChatGPT分析（安全実装・拡張版）")
 
-# 起動時：OpenAI疎通（軽量）
 client = get_openai_client()
 try:
     _ = client.models.list()
@@ -20,6 +19,11 @@ except Exception as e:
 
 root_url = st.text_input("開始URL（同一ドメイン内を対象）", placeholder="https://example.com/")
 max_pages = st.slider("最大クロール数", 5, 300, 40)
+colA, colB = st.columns([2,1])
+with colA:
+    min_words = st.slider("最低本文語数（薄いページ除外）", 0, 1000, 400, 50)
+with colB:
+    include_thin = st.checkbox("薄いページも含める", value=False, help="チェックすると語数条件を無視して全件を対象にします")
 
 if "cancel" not in st.session_state:
     st.session_state.cancel = False
@@ -63,13 +67,36 @@ if start_btn:
     async def main():
         progress.progress(0.0, text="クロール中…")
         try:
-            pages = await crawl_site(root_url.strip(), max_pages=max_pages)
+            pages, stats = await crawl_site(
+                root_url.strip(),
+                max_pages=max_pages,
+                min_words=min_words,
+                include_thin=include_thin
+            )
         except Exception as e:
             st.error(f"クロールエラー: {e.__class__.__name__}")
-            return {}, {}
+            return {}, {}, {}
 
-        if st.session_state.cancel or not pages:
-            return {}, {}
+        if st.session_state.cancel:
+            return {}, {}, {}
+
+        # 内訳を先に表示
+        with st.expander("クロール内訳（診断）", expanded=True):
+            st.write({
+                "crawled": stats.get("crawled", 0),
+                "status_200_html": stats.get("status_200_html", 0),
+                "final_kept": stats.get("final_kept", 0),
+                "filtered_thin": stats.get("filtered_thin", 0),
+                "skipped_noindex": stats.get("skipped_noindex", 0),
+                "robots_denied": stats.get("robots_denied", 0),
+                "fetch_error": stats.get("fetch_error", 0),
+                "min_words": min_words,
+                "include_thin": include_thin,
+            })
+
+        if not pages:
+            progress.progress(1.0, text="完了")
+            return {}, {}, stats
 
         # メトリクス計算
         progress.progress(0.4, text="メトリクス算出中…")
@@ -93,16 +120,15 @@ if start_btn:
                 }
 
         progress.progress(1.0, text="完了")
-        return metrics_map, audits
+        return metrics_map, audits, stats
 
-    metrics_map, audits = run_async(main())
+    metrics_map, audits, stats = run_async(main())
     st.session_state.running = False
 
     if not metrics_map:
-        st.info("対象ページがありません（薄いページのみ/中断など）。")
+        st.info("対象ページがありません。（語数条件や noindex/robots により除外された可能性があります）")
         st.stop()
 
-    # ===== 集計テーブル =====
     st.subheader("ページ別スコア（SEO/UX）")
     rows = []
     for u, m in metrics_map.items():
@@ -121,7 +147,6 @@ if start_btn:
         })
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
-    # ===== 詳細（1ページずつ）=====
     st.subheader("詳細（提案）")
     for u in sorted(metrics_map.keys()):
         with st.expander(u, expanded=False):
@@ -142,16 +167,13 @@ if start_btn:
                 for it in a["recommendations"]:
                     st.write(f"- {it}")
 
-    # ===== エクスポート =====
     st.subheader("エクスポート")
-    # JSON
     bundle = {u: {"metrics": metrics_map[u], "audit": audits.get(u, {})} for u in metrics_map}
     buf = io.StringIO()
     json.dump(bundle, buf, ensure_ascii=False, indent=2)
     st.download_button("JSON（全件）をダウンロード", data=buf.getvalue(),
                        file_name="audit_full.json", mime="application/json")
 
-    # CSV（スコアサマリ）
     csv_buf = io.StringIO()
     fieldnames = ["URL","Title","SEO","UX","Words","Alt%","Links","LD+JSON","Viewport","MetaDesc","H1"]
     writer = csv.DictWriter(csv_buf, fieldnames=fieldnames)
