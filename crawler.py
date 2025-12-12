@@ -1,4 +1,4 @@
-# crawler.py — Secure crawler: SSRF guard, strict robots, size cap, rich extraction + stats
+# crawler.py — Secure crawler: SSRF guard, robots, size cap, IPv4 force, retries, rich stats
 import asyncio, re, ipaddress, socket
 from urllib.parse import urljoin, urldefrag, urlparse
 import aiohttp
@@ -7,21 +7,18 @@ from bs4 import BeautifulSoup
 import urllib.robotparser as rp
 
 # ===== Tunables =====
-DEFAULT_DELAY = 1.5  # WAF/レート制限に優しいデフォルト
-TIMEOUT = aiohttp.ClientTimeout(total=20, connect=5)
-MAX_BYTES = 4 * 1024 * 1024  # 4MB 上限
+DEFAULT_DELAY = 1.2
+TIMEOUT = aiohttp.ClientTimeout(total=40, connect=10, sock_read=30)
+MAX_BYTES = 4 * 1024 * 1024  # 4MB
 
-# 中立・安全なUA（必要なら書き換えてOK）
+# ブラウザ相当のUA（ブロック回避用）
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 )
-# 例）自作識別子にしたい場合：
-# UA = "SiteAuditBot/1.0 (+https://github.com/your-id; contact: you@example.com)"
 
 # ===== Helpers =====
 def _is_private_ip(host: str) -> bool:
-    """DNS解決してプライベート/ループバック等なら True"""
     try:
         infos = socket.getaddrinfo(host, None)
         for _, _, _, _, sockaddr in infos:
@@ -37,14 +34,12 @@ def _is_private_ip(host: str) -> bool:
     return False
 
 def _etld1(host: str) -> str:
-    """example.com / hatenablog.com など eTLD+1 を返す"""
     if not host:
         return ""
     t = tldextract.extract(host)
     return f"{t.domain}.{t.suffix}"
 
 def normalize_url(base: str, href: str) -> str | None:
-    """同一 eTLD+1 内リンクのみ許可し、プライベートIPを拒否"""
     if not href:
         return None
     url = urljoin(base, href)
@@ -52,48 +47,43 @@ def normalize_url(base: str, href: str) -> str | None:
     p = urlparse(url)
     if p.scheme not in ("http", "https"):
         return None
-
     base_host = urlparse(base).hostname or ""
     host = p.hostname or ""
-    # eTLD+1が同じ（例：example.com内）ならOK
     if _etld1(base_host) != _etld1(host):
         return None
     if _is_private_ip(host):
         return None
     return url
 
+# ===== HTTP fetch (IPv4強制 + リトライ) =====
 async def fetch_text(session: aiohttp.ClientSession, url: str):
     """
-    最大サイズ制限付きでHTML取得。WAF/CDN耐性を強化。
+    HTML取得。WAF/CDNに弾かれにくいヘッダで3回まで試行。
     """
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/123.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        # Accept-Encoding は明示しない（aiohttpが自動処理）
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
         "Connection": "keep-alive",
     }
 
-    try:
-        for attempt in range(3):  # 最大3回リトライ
+    for attempt in range(3):
+        try:
             async with session.get(
                 url,
                 timeout=TIMEOUT,
                 headers=headers,
                 allow_redirects=True,
-                ssl=False  # SSL検証を緩める（自己署名やTLS差異対策）
             ) as r:
                 final = str(r.url)
                 fp = urlparse(final)
                 orig_host = urlparse(url).hostname or ""
                 final_host = fp.hostname or ""
 
-                # eTLD+1外 or プライベートIP は拒否
+                # eTLD+1外やプライベートIPへの導線は拒否（SSRF防御）
                 if _etld1(orig_host) != _etld1(final_host) or _is_private_ip(final_host):
                     return 451, None, {
                         "Final-URL": final,
@@ -114,23 +104,25 @@ async def fetch_text(session: aiohttp.ClientSession, url: str):
                         chunks.append(chunk)
                     html = b"".join(chunks).decode(errors="ignore") if chunks else None
 
-                headers_out = dict(r.headers)
-                headers_out["Final-URL"] = final
-                headers_out["__status"] = str(r.status)
-                headers_out["__is_html"] = str(bool(is_html))
+                hdrs = dict(r.headers)
+                hdrs["Final-URL"] = final
+                hdrs["__status"] = str(r.status)
+                hdrs["__is_html"] = str(bool(is_html))
+
                 if html:
-                    return r.status, html, headers_out
+                    return r.status, html, hdrs
 
-            await asyncio.sleep(1.5)  # 少し待って再試行
-        return 0, None, {"__exc": "MaxRetryExceeded"}
-    except Exception as e:
-        return 0, None, {"__exc": e.__class__.__name__}
+        except Exception as e:
+            # attemptごとに少し待って再試行
+            last_exc = e.__class__.__name__
+            await asyncio.sleep(1.2)
 
+    return 0, None, {"__exc": last_exc if 'last_exc' in locals() else "Unknown"}
 
 async def get_robots(session, base_url: str):
     base = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
     robots_url = urljoin(base, "/robots.txt")
-    status, txt, _ = await fetch_text(session, robots_url)
+    _status, txt, _ = await fetch_text(session, robots_url)
     parser = rp.RobotFileParser()
     parser.set_url(robots_url)
     parser.parse((txt or "").splitlines())
@@ -153,7 +145,6 @@ def _strip_nav(soup: BeautifulSoup):
 def extract_rich(url: str, html: str):
     soup = BeautifulSoup(html, "html.parser")
 
-    # meta robots noindex/nofollow
     robots_tag = soup.find("meta", attrs={"name": lambda x: x and x.lower() == "robots"})
     if robots_tag:
         content = (robots_tag.get("content") or "").lower()
@@ -185,14 +176,12 @@ def extract_rich(url: str, html: str):
 
     has_ldjson = bool(soup.find("script", attrs={"type": "application/ld+json"}))
 
-    # 画像とalt
     imgs = []
     for im in soup.find_all("img"):
         src = im.get("src") or ""
         alt = im.get("alt") or ""
         imgs.append({"src": src, "alt": alt})
 
-    # 内部リンク（同一 eTLD+1 内）
     links = set()
     for a in soup.find_all("a", href=True):
         nu = normalize_url(url, a["href"])
@@ -234,7 +223,7 @@ async def crawl_site(root_url: str, max_pages=50, min_words=400, include_thin=Fa
     """
     Returns:
       final_pages: dict[url -> rich_page_dict]
-      stats: dict (counters + 'fail_samples' for debugging)
+      stats: dict (counters + 'fail_samples')
     """
     visited, queue = set([root_url]), [root_url]
     results = {}
@@ -246,11 +235,12 @@ async def crawl_site(root_url: str, max_pages=50, min_words=400, include_thin=Fa
         "robots_denied": 0,
         "fetch_error": 0,
         "status_200_html": 0,
-        "fail_samples": [],  # 最大5件
+        "fail_samples": [],
     }
-    limiter = DomainLimiter(concurrency=2)
 
-    async with aiohttp.ClientSession() as session:
+    # IPv4強制 + SSL検証OFF のコネクタ（Cloud環境のIPv6/TLS相性対策）
+    connector = aiohttp.TCPConnector(ssl=False, family=socket.AF_INET, limit=16)
+    async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
         robots = await get_robots(session, root_url)
 
         async def worker():
@@ -258,19 +248,17 @@ async def crawl_site(root_url: str, max_pages=50, min_words=400, include_thin=Fa
             while queue and len(results) < max_pages:
                 url = queue.pop(0)
 
-                # robots 判定（フルURL）
                 if not allowed(robots, url):
                     results[url] = {"status": 451, "url": url}
                     stats["robots_denied"] += 1
                     continue
 
-                # プライベートIP対策（念のため）
                 if _is_private_ip(urlparse(url).hostname or ""):
                     results[url] = {"status": 451, "url": url}
                     stats["robots_denied"] += 1
                     continue
 
-                sem = limiter.sem(url)
+                sem = DomainLimiter(concurrency=2).sem(url)
                 async with sem:
                     status, html, hdrs = await fetch_text(session, url)
                     stats["crawled"] += 1
@@ -303,7 +291,6 @@ async def crawl_site(root_url: str, max_pages=50, min_words=400, include_thin=Fa
         workers = [asyncio.create_task(worker()) for _ in range(4)]
         await asyncio.gather(*workers)
 
-    # フィルタリング
     final = {}
     for u, v in results.items():
         if v.get("status") == 200 and not v.get("skipped"):
@@ -313,4 +300,3 @@ async def crawl_site(root_url: str, max_pages=50, min_words=400, include_thin=Fa
             else:
                 stats["filtered_thin"] += 1
     return final, stats
-
