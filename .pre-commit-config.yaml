@@ -15,3 +15,11 @@ repos:
     rev: v8.18.4
     hooks:
       - id: gitleaks
+
+repos:
+  - repo: https://github.com/psf/black
+    rev: 23.12.1
+    hooks:
+      - id: black
+        args: ["--line-length=88"]
+
