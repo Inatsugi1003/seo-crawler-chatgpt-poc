@@ -1,3 +1,4 @@
+# llm.py — LLM suggestions (JSON) using metrics + text excerpt
 from openai import OpenAI
 
 SCHEMA = {
@@ -5,63 +6,53 @@ SCHEMA = {
   "schema": {
     "type": "object",
     "properties": {
-      "page_title": {"type": "string"},
       "summary": {"type": "string"},
-      "issues": {"type": "array", "items": {"type": "string"}},
-      "recommendations": {"type": "array", "items": {"type": "string"}},
-      "evidence": {"type": "array", "items": {"type": "string"}}
+      "top_issues": {"type": "array", "items": {"type":"string"}},
+      "recommendations": {"type": "array", "items": {"type":"string"}}
     },
-    "required": ["page_title", "summary", "recommendations"]
+    "required": ["recommendations"]
   },
   "strict": True
 }
 
-SYSTEM = "You are an SEO & UX auditor. Return strict JSON only."
+SYSTEM = (
+    "You are an SEO & UX auditor. "
+    "Return strict JSON only (summary, top_issues, recommendations). "
+    "Use the provided RULE metrics to prioritize, and keep each item concise (<=140 chars)."
+)
 
-def page_audit(client: OpenAI, url: str, title: str, text: str, max_chars=5000):
-    # チャンク化（超シンプル：文字数でカット）
-    chunks = []
-    buf = []
-    length = 0
-    for para in text.split("\n\n"):
-        if length + len(para) > max_chars:
-            chunks.append("\n\n".join(buf)); buf=[para]; length=len(para)
-        else:
-            buf.append(para); length += len(para)
-    if buf: chunks.append("\n\n".join(buf))
+def _excerpt(text: str, limit_chars=3000) -> str:
+    t = text or ""
+    return t[:limit_chars]
 
-    partials = []
-    for i, ch in enumerate(chunks, 1):
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type":"json_schema","json_schema":SCHEMA},
-            messages=[
-                {"role":"system","content": SYSTEM},
-                {"role":"user","content": f"URL: {url}\nTITLE: {title}\nCHUNK {i}/{len(chunks)}:\n{ch}"}
-            ],
-            temperature=0.1
+def page_audit(client: OpenAI, page: dict, metrics: dict):
+    # metrics と 短い本文抜粋を渡して、提案を生成（JSON）
+    body = {
+        "url": metrics.get("url"),
+        "title": metrics.get("title"),
+        "metrics": metrics,
+        "text_excerpt": _excerpt(page.get("text","")),
+        "rules_hint": (
+            "Prioritize: missing meta description/title/h1, low alt coverage, no viewport, "
+            "no ld+json, thin content (<800 words), weak internal links."
         )
-        partials.append(resp.choices[0].message.parsed)
-
-    # reduce（集約）
-    summary = " ".join(p.get("summary","") for p in partials)[:2000]
-    issues = []
-    recs = []
-    for p in partials:
-        issues.extend(p.get("issues",[]))
-        recs.extend(p.get("recommendations",[]))
-    # 重複削り（ざっくり）
-    def uniq(xs): 
-        seen=set(); out=[]
-        for x in xs:
-            k=x.strip()
-            if k and k.lower() not in seen:
-                out.append(x); seen.add(k.lower())
-        return out
+    }
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        response_format={"type":"json_schema","json_schema":SCHEMA},
+        messages=[
+            {"role":"system","content": SYSTEM},
+            {"role":"user","content": str(body)}
+        ],
+        temperature=0.1,
+        max_tokens=400
+    )
+    data = resp.choices[0].message.parsed
+    # 最後に各配列を短縮
+    issues = (data.get("top_issues") or [])[:5]
+    recs = (data.get("recommendations") or [])[:5]
     return {
-        "page_title": title,
-        "summary": summary,
-        "issues": uniq(issues)[:20],
-        "recommendations": uniq(recs)[:20],
-        "evidence": [url]
+        "summary": data.get("summary",""),
+        "top_issues": issues,
+        "recommendations": recs,
     }
