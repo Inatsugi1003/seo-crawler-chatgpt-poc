@@ -10,12 +10,8 @@ DEFAULT_DELAY = 0.75
 TIMEOUT = aiohttp.ClientTimeout(total=20, connect=5)
 MAX_BYTES = 4 * 1024 * 1024  # 4MB 上限
 
-# ===============================
-# 🟢 改善済み UA（安全・中立・誤認なし）
-# ===============================
-UA = "SiteAuditBot/1.0 (+https://github.com/inatsugi1003)"
-# ↑ あなたの GitHub ID に置換済み。メールは任意（公開しないなら削除OK）。
-# 例）UA = "SiteAuditBot/1.0 (internal use; no contact info)"
+# 中立のUA（誤認防止）
+UA = "SiteAuditBot/1.0 (+https://github.com/inatsugi1003; contact: example@example.com)"
 
 def _is_private_ip(host: str) -> bool:
     try:
@@ -40,15 +36,18 @@ def normalize_url(base: str, href: str) -> str | None:
     p = urlparse(url)
     if p.scheme not in ("http", "https"):
         return None
+    # 同一ホストのみ
     base_host = urlparse(base).netloc
     if p.netloc != base_host:
         return None
+    # プライベートIP拒否
     host_only = p.hostname or ""
     if _is_private_ip(host_only):
         return None
     return url
 
 async def fetch_text(session: aiohttp.ClientSession, url: str):
+    """最大サイズ制限付きでHTML取得。リダイレクト最終URLも検査。"""
     try:
         async with session.get(
             url,
@@ -65,6 +64,7 @@ async def fetch_text(session: aiohttp.ClientSession, url: str):
         ) as r:
             final = str(r.url)
             fp = urlparse(final)
+            # リダイレクトで別ホスト/プライベートへ飛ぶのを拒否
             if fp.netloc != urlparse(url).netloc or _is_private_ip(fp.hostname or ""):
                 return 451, None, {"Final-URL": final, "Reason": "host_changed_or_private"}
 
@@ -116,6 +116,7 @@ def _strip_nav(soup: BeautifulSoup):
 def extract_rich(url: str, html: str):
     soup = BeautifulSoup(html, "html.parser")
 
+    # meta robots
     robots_tag = soup.find("meta", attrs={"name": lambda x: x and x.lower() == "robots"})
     if robots_tag:
         content = (robots_tag.get("content") or "").lower()
@@ -189,3 +190,86 @@ class DomainLimiter:
         if domain not in self._sems:
             self._sems[domain] = asyncio.Semaphore(self._conc)
         return self._sems[domain]
+
+async def crawl_site(root_url: str, max_pages=50, min_words=400, include_thin=False):
+    """
+    return: (final_pages: dict[url->rich], stats: dict)
+    stats にはスキップ理由の内訳を格納
+    """
+    visited, queue = set([root_url]), [root_url]
+    results = {}  # url -> rich or status
+    stats = {
+        "crawled": 0,
+        "final_kept": 0,
+        "filtered_thin": 0,
+        "skipped_noindex": 0,
+        "robots_denied": 0,
+        "fetch_error": 0,
+        "status_200_html": 0,
+        "fail_samples": [],   # 失敗理由のサンプル（最大5件）
+    }
+    limiter = DomainLimiter(concurrency=2)
+
+    async with aiohttp.ClientSession() as session:
+        robots = await get_robots(session, root_url)
+
+        async def worker():
+            nonlocal stats
+            while queue and len(results) < max_pages:
+                url = queue.pop(0)
+
+                # robots判定（フルURL）
+                if not allowed(robots, url):
+                    results[url] = {"status": 451, "url": url}
+                    stats["robots_denied"] += 1
+                    continue
+
+                # プライベートIP対策
+                if _is_private_ip(urlparse(url).hostname or ""):
+                    results[url] = {"status": 451, "url": url}
+                    stats["robots_denied"] += 1
+                    continue
+
+                sem = limiter.sem(url)
+                async with sem:
+                    status, html, hdrs = await fetch_text(session, url)
+                    stats["crawled"] += 1
+                    if status != 200 or not html:
+                        results[url] = {"status": status, "url": url}
+                        stats["fetch_error"] += 1
+                        if len(stats["fail_samples"]) < 5:
+                            stats["fail_samples"].append({
+                                "url": url,
+                                "status": status,
+                                "final_url": (hdrs or {}).get("Final-URL"),
+                                "is_html": (hdrs or {}).get("__is_html"),
+                                "content_type": (hdrs or {}).get("Content-Type"),
+                                "reason": (hdrs or {}).get("Reason") or (hdrs or {}).get("__exc"),
+                            })
+                    else:
+                        stats["status_200_html"] += 1
+                        rich = extract_rich(url, html)
+                        if rich.get("skip_by_meta"):
+                            results[url] = {"status": 200, "url": url, "skipped": True}
+                            stats["skipped_noindex"] += 1
+                        else:
+                            results[url] = rich
+                            for link in rich.get("links", []):
+                                if link not in visited and len(results) + len(queue) < max_pages:
+                                    visited.add(link)
+                                    queue.append(link)
+                await asyncio.sleep(DEFAULT_DELAY)
+
+        workers = [asyncio.create_task(worker()) for _ in range(4)]
+        await asyncio.gather(*workers)
+
+    # フィルタリング
+    final = {}
+    for u, v in results.items():
+        if v.get("status") == 200 and not v.get("skipped"):
+            if include_thin or (v.get("word_count", 0) >= min_words):
+                final[u] = v
+                stats["final_kept"] += 1
+            else:
+                stats["filtered_thin"] += 1
+    return final, stats
