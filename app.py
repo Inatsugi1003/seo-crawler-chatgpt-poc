@@ -1,59 +1,25 @@
-# app.py  —— Site Crawl & Audit (Safe / Health-check / Robust)
-import asyncio, json, io
+# app.py — crawl -> metrics -> LLM suggestions -> dashboard
+import asyncio, json, io, csv
 import streamlit as st
 from secure_openai_client import get_openai_client
 from crawler import crawl_site
+from analyzer import compute_metrics
 from llm import page_audit
 
-# ---------------------------
-# Page setup
-# ---------------------------
 st.set_page_config(page_title="Site Crawl & Audit (Safe)", page_icon="🕸️")
-st.title("サイト自動クロール × ChatGPT分析（安全実装）")
+st.title("サイト自動クロール × ChatGPT分析（安全実装・拡張版）")
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def ensure_openai_client():
-    """Secrets/環境変数からOpenAIクライアントを取得し、起動時に疎通確認も行う。"""
-    if "openai_client" in st.session_state and st.session_state.get("openai_ok"):
-        return st.session_state["openai_client"]
+# 起動時にOpenAIだけ先に作って疎通確認（軽量）
+client = get_openai_client()
+try:
+    _ = client.models.list()
+    st.caption("🟢 OpenAI: 接続確認OK")
+except Exception as e:
+    st.error(f"OpenAI接続エラー: {e.__class__.__name__}")
+    st.stop()
 
-    client = get_openai_client()  # 内部でキー未設定は stop() 済み
-
-    # ✅ ヘルスチェック：モデル一覧呼び出しで“キーの有効性 & 通信”を確認
-    try:
-        _ = client.models.list()
-        st.caption("🟢 OpenAI: 接続確認OK")
-        st.session_state["openai_client"] = client
-        st.session_state["openai_ok"] = True
-        return client
-    except Exception as e:
-        st.error(f"🔴 OpenAI接続エラー（{e.__class__.__name__}）")
-        st.stop()
-
-def run_async(coro):
-    """Streamlitで安全にasync関数を実行（既存ループ衝突対策）。"""
-    try:
-        return asyncio.run(coro)
-    except RuntimeError:
-        # まれに既存イベントループがある環境向けに新規ループで実行
-        loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(loop)
-            return loop.run_until_complete(coro)
-        finally:
-            try:
-                loop.run_until_complete(loop.shutdown_asyncgens())
-            except Exception:
-                pass
-            loop.close()
-
-# ---------------------------
-# UI — Inputs
-# ---------------------------
 root_url = st.text_input("開始URL（同一ドメイン内を対象）", placeholder="https://example.com/")
-max_pages = st.slider("最大クロール数", 5, 300, 30)
+max_pages = st.slider("最大クロール数", 5, 300, 40)
 
 if "cancel" not in st.session_state:
     st.session_state.cancel = False
@@ -66,94 +32,138 @@ cancel_btn = col2.button("中断", disabled=not st.session_state.running)
 
 if cancel_btn:
     st.session_state.cancel = True
-    st.info("中断リクエストを受け付けました。進行中のタスクを安全に停止します…")
+    st.info("中断リクエストを受け付けました…")
 
-# ---------------------------
-# Run
-# ---------------------------
+def run_async(coro):
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            loop.close()
+
 if start_btn:
     if not root_url.strip():
         st.warning("開始URLを入力してください。")
         st.stop()
 
-    st.session_state.cancel = False
     st.session_state.running = True
-
-    client = ensure_openai_client()
+    st.session_state.cancel = False
 
     progress = st.empty()
     status_box = st.empty()
-    result_holder = st.empty()
 
     async def main():
-        # クロール
         progress.progress(0.0, text="クロール中…")
         try:
             pages = await crawl_site(root_url.strip(), max_pages=max_pages)
         except Exception as e:
-            st.error(f"クロールでエラーが発生しました（{e.__class__.__name__}）。URLやrobots.txt、ネットワーク状態をご確認ください。")
-            return {}
+            st.error(f"クロールエラー: {e.__class__.__name__}")
+            return {}, {}
 
-        if st.session_state.cancel:
-            return {}
+        if st.session_state.cancel or not pages:
+            return {}, {}
 
-        if not pages:
-            progress.progress(1.0, text="完了（対象ページなし／薄いページのみ）")
-            return {}
+        # メトリクス計算
+        progress.progress(0.4, text="メトリクス算出中…")
+        metrics_map = {}
+        for u, page in pages.items():
+            metrics_map[u] = compute_metrics(page)
 
-        # 分析
-        progress.progress(0.5, text=f"分析中…（{len(pages)}ページ）")
-        results = {}
+        # LLM提案
+        progress.progress(0.7, text="LLM提案生成中…")
+        audits = {}
         total = len(pages)
-        for i, (url, meta) in enumerate(pages.items(), start=1):
+        for i, (u, page) in enumerate(pages.items(), start=1):
             if st.session_state.cancel:
                 break
-            status_box.write(f"解析 {i}/{total}: {url}")
+            status_box.write(f"分析 {i}/{total}: {u}")
             try:
-                audit = page_audit(
-                    client,
-                    url,
-                    meta.get("title", ""),
-                    meta.get("text", "")
-                )
+                audits[u] = page_audit(client, page, metrics_map[u])
             except Exception as e:
-                # 特定ページの分析失敗はスキップして続行
-                audit = {
-                    "page_title": meta.get("title", "") or "",
+                audits[u] = {
                     "summary": "",
-                    "issues": [f"LLM分析エラー: {e.__class__.__name__}"],
-                    "recommendations": [],
-                    "evidence": [url],
+                    "top_issues": [f"LLMエラー: {e.__class__.__name__}"],
+                    "recommendations": []
                 }
-            results[url] = audit
 
         progress.progress(1.0, text="完了")
-        return results
+        return metrics_map, audits
 
-    results = run_async(main())
-
+    metrics_map, audits = run_async(main())
     st.session_state.running = False
 
-    # ---------------------------
-    # Output
-    # ---------------------------
-    if st.session_state.cancel:
-        st.warning("ユーザー操作により中断されました。")
-    elif results:
-        st.subheader("結果")
-        # JSON整形表示（大規模でも軽めに表示したい場合は抜粋に変更可）
-        st.json(results)
+    if not metrics_map:
+        st.info("対象ページがありません（薄いページのみ/中断など）。")
+        st.stop()
 
-        # ダウンロード用
-        buf = io.StringIO()
-        json.dump(results, buf, ensure_ascii=False, indent=2)
-        st.download_button(
-            "JSONをダウンロード",
-            data=buf.getvalue(),
-            file_name="audit_results.json",
-            mime="application/json"
-        )
-    else:
-        st.info("結果はありません（対象ページが無い、または全てスキップされた可能性があります）。")
+    # ===== 集計テーブル =====
+    st.subheader("ページ別スコア（SEO/UX）")
+    rows = []
+    for u, m in metrics_map.items():
+        rows.append({
+            "URL": u,
+            "Title": (m.get("title") or "")[:60],
+            "SEO": m.get("seo_score"),
+            "UX": m.get("ux_score"),
+            "Words": m.get("word_count"),
+            "Alt%": m.get("images_alt_ratio"),
+            "Links": m.get("internal_links"),
+            "LD+JSON": "Yes" if m.get("has_ldjson") else "No",
+            "Viewport": "Yes" if m.get("has_viewport") else "No",
+            "MetaDesc": "Yes" if m.get("has_meta_description") else "No",
+            "H1": "Yes" if m.get("has_h1") else "No",
+        })
+    st.dataframe(rows, use_container_width=True, hide_index=True)
 
+    # ===== 詳細（1ページずつ）=====
+    st.subheader("詳細（提案）")
+    for u in sorted(metrics_map.keys()):
+        with st.expander(u, expanded=False):
+            m = metrics_map[u]
+            a = audits.get(u, {})
+            st.markdown(f"**Title:** {m.get('title','')}")
+            st.markdown(f"- SEO: {m.get('seo_score')} / UX: {m.get('ux_score')}")
+            st.markdown(f"- Words: {m.get('word_count')}  Links: {m.get('internal_links')}  Alt%: {m.get('images_alt_ratio')}")
+            st.markdown(f"- LD+JSON: {'Yes' if m.get('has_ldjson') else 'No'} / Viewport: {'Yes' if m.get('has_viewport') else 'No'}")
+            if a.get("summary"):
+                st.markdown(f"**Summary:** {a['summary']}")
+            if a.get("top_issues"):
+                st.markdown("**Top Issues:**")
+                for it in a["top_issues"]:
+                    st.write(f"- {it}")
+            if a.get("recommendations"):
+                st.markdown("**Recommendations:**")
+                for it in a["recommendations"]:
+                    st.write(f"- {it}")
 
+    # ===== エクスポート =====
+    st.subheader("エクスポート")
+    # JSON
+    bundle = {}
+    for u in metrics_map:
+        bundle[u] = {
+            "metrics": metrics_map[u],
+            "audit": audits.get(u, {})
+        }
+    buf = io.StringIO()
+    json.dump(bundle, buf, ensure_ascii=False, indent=2)
+    st.download_button("JSON（全件）をダウンロード", data=buf.getvalue(),
+                       file_name="audit_full.json", mime="application/json")
+
+    # CSV（スコアサマリ）
+    csv_buf = io.StringIO()
+    fieldnames = ["URL","Title","SEO","UX","Words","Alt%","Links","LD+JSON","Viewport","MetaDesc","H1"]
+    writer = csv.DictWriter(csv_buf, fieldnames=fieldnames)
+    writer.writeheader()
+    for r in rows:
+        writer.writerow(r)
+    st.download_button("CSV（スコア表）をダウンロード", data=csv_buf.getvalue(),
+                       file_name="audit_scores.csv", mime="text/csv")
