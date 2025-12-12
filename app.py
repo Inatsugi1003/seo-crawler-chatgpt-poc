@@ -65,68 +65,68 @@ if start_btn:
     status_box = st.empty()
 
     async def main():
-        progress.progress(0.0, text="クロール中…")
-        try:
-            pages, stats = await crawl_site(
-                root_url.strip(),
-                max_pages=max_pages,
-                min_words=min_words,
-                include_thin=include_thin
-            )
-        except Exception as e:
-            st.error(f"クロールエラー: {e.__class__.__name__}")
-            return {}, {}, {}
+    progress.progress(0.0, text="クロール中…")
+    try:
+        pages, stats = await crawl_site(
+            root_url.strip(),
+            max_pages=max_pages,
+            min_words=min_words,
+            include_thin=include_thin
+        )
+    except Exception as e:
+        st.error(f"クロールエラー: {e.__class__.__name__}")
+        return {}, {}, {}
 
-        if st.session_state.cancel:
-            return {}, {}, {}
+    if st.session_state.cancel:
+        return {}, {}, {}
 
-        with st.expander("クロール内訳（診断）", expanded=True):
-    st.write({
-        "crawled": stats.get("crawled", 0),
-        "status_200_html": stats.get("status_200_html", 0),
-        "final_kept": stats.get("final_kept", 0),
-        "filtered_thin": stats.get("filtered_thin", 0),
-        "skipped_noindex": stats.get("skipped_noindex", 0),
-        "robots_denied": stats.get("robots_denied", 0),
-        "fetch_error": stats.get("fetch_error", 0),
-        "min_words": min_words,
-        "include_thin": include_thin,
-    })
-    fails = stats.get("fail_samples") or []
-    if fails:
-        st.markdown("**失敗サンプル（最大5件）**")
-        for f in fails:
-            st.code(f, language="json")
+    # ← ここから expander ブロック（with の中は更に4スペース）
+    with st.expander("クロール内訳（診断）", expanded=True):
+        st.write({
+            "crawled": stats.get("crawled", 0),
+            "status_200_html": stats.get("status_200_html", 0),
+            "final_kept": stats.get("final_kept", 0),
+            "filtered_thin": stats.get("filtered_thin", 0),
+            "skipped_noindex": stats.get("skipped_noindex", 0),
+            "robots_denied": stats.get("robots_denied", 0),
+            "fetch_error": stats.get("fetch_error", 0),
+            "min_words": min_words,
+            "include_thin": include_thin,
+        })
+        fails = stats.get("fail_samples") or []
+        if fails:
+            st.markdown("**失敗サンプル（最大5件）**")
+            for f in fails:
+                st.code(f, language="json")
 
-
-
-        if not pages:
-            progress.progress(1.0, text="完了")
-            return {}, {}, stats
-
-        # メトリクス計算
-        progress.progress(0.4, text="メトリクス算出中…")
-        metrics_map = {u: compute_metrics(p) for u, p in pages.items()}
-
-        # LLM提案
-        progress.progress(0.7, text="LLM提案生成中…")
-        audits = {}
-        total = len(pages)
-        for i, (u, page) in enumerate(pages.items(), start=1):
-            if st.session_state.cancel:
-                break
-            status_box.write(f"分析 {i}/{total}: {u}")
-            try:
-                audits[u] = page_audit(client, page, metrics_map[u])
-            except Exception as e:
-                audits[u] = {
-                    "summary": "",
-                    "top_issues": [f"LLMエラー: {e.__class__.__name__}"],
-                    "recommendations": []
-                }
-
+    if not pages:
         progress.progress(1.0, text="完了")
-        return metrics_map, audits, stats
+        return {}, {}, stats
+
+    # メトリクス計算
+    progress.progress(0.4, text="メトリクス算出中…")
+    metrics_map = {u: compute_metrics(p) for u, p in pages.items()}
+
+    # LLM提案
+    progress.progress(0.7, text="LLM提案生成中…")
+    audits = {}
+    total = len(pages)
+    for i, (u, page) in enumerate(pages.items(), start=1):
+        if st.session_state.cancel:
+            break
+        status_box.write(f"分析 {i}/{total}: {u}")
+        try:
+            audits[u] = page_audit(client, page, metrics_map[u])
+        except Exception as e:
+            audits[u] = {
+                "summary": "",
+                "top_issues": [f"LLMエラー: {e.__class__.__name__}"],
+                "recommendations": []
+            }
+
+    progress.progress(1.0, text="完了")
+    return metrics_map, audits, stats
+
 
     metrics_map, audits, stats = run_async(main())
     st.session_state.running = False
@@ -188,6 +188,7 @@ if start_btn:
         writer.writerow(r)
     st.download_button("CSV（スコア表）をダウンロード", data=csv_buf.getvalue(),
                        file_name="audit_scores.csv", mime="text/csv")
+
 
 
 
