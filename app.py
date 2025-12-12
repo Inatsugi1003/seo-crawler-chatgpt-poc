@@ -9,6 +9,7 @@ from llm import page_audit
 st.set_page_config(page_title="Site Crawl & Audit (Safe)", page_icon="🕸️")
 st.title("サイト自動クロール × ChatGPT分析（安全実装・拡張版）")
 
+# --- OpenAI接続確認 ---
 client = get_openai_client()
 try:
     _ = client.models.list()
@@ -17,9 +18,10 @@ except Exception as e:
     st.error(f"OpenAI接続エラー: {e.__class__.__name__}")
     st.stop()
 
+# --- 入力項目 ---
 root_url = st.text_input("開始URL（同一ドメイン内を対象）", placeholder="https://example.com/")
 max_pages = st.slider("最大クロール数", 5, 300, 40)
-colA, colB = st.columns([2,1])
+colA, colB = st.columns([2, 1])
 with colA:
     min_words = st.slider("最低本文語数（薄いページ除外）", 0, 1000, 400, 50)
 with colB:
@@ -38,6 +40,7 @@ if cancel_btn:
     st.session_state.cancel = True
     st.info("中断リクエストを受け付けました…")
 
+# --- asyncio wrapper ---
 def run_async(coro):
     try:
         return asyncio.run(coro)
@@ -53,6 +56,7 @@ def run_async(coro):
                 pass
             loop.close()
 
+# --- メイン処理 ---
 if start_btn:
     if not root_url.strip():
         st.warning("開始URLを入力してください。")
@@ -65,68 +69,67 @@ if start_btn:
     status_box = st.empty()
 
     async def main():
-    progress.progress(0.0, text="クロール中…")
-    try:
-        pages, stats = await crawl_site(
-            root_url.strip(),
-            max_pages=max_pages,
-            min_words=min_words,
-            include_thin=include_thin
-        )
-    except Exception as e:
-        st.error(f"クロールエラー: {e.__class__.__name__}")
-        return {}, {}, {}
-
-    if st.session_state.cancel:
-        return {}, {}, {}
-
-    # ← ここから expander ブロック（with の中は更に4スペース）
-    with st.expander("クロール内訳（診断）", expanded=True):
-        st.write({
-            "crawled": stats.get("crawled", 0),
-            "status_200_html": stats.get("status_200_html", 0),
-            "final_kept": stats.get("final_kept", 0),
-            "filtered_thin": stats.get("filtered_thin", 0),
-            "skipped_noindex": stats.get("skipped_noindex", 0),
-            "robots_denied": stats.get("robots_denied", 0),
-            "fetch_error": stats.get("fetch_error", 0),
-            "min_words": min_words,
-            "include_thin": include_thin,
-        })
-        fails = stats.get("fail_samples") or []
-        if fails:
-            st.markdown("**失敗サンプル（最大5件）**")
-            for f in fails:
-                st.code(f, language="json")
-
-    if not pages:
-        progress.progress(1.0, text="完了")
-        return {}, {}, stats
-
-    # メトリクス計算
-    progress.progress(0.4, text="メトリクス算出中…")
-    metrics_map = {u: compute_metrics(p) for u, p in pages.items()}
-
-    # LLM提案
-    progress.progress(0.7, text="LLM提案生成中…")
-    audits = {}
-    total = len(pages)
-    for i, (u, page) in enumerate(pages.items(), start=1):
-        if st.session_state.cancel:
-            break
-        status_box.write(f"分析 {i}/{total}: {u}")
+        progress.progress(0.0, text="クロール中…")
         try:
-            audits[u] = page_audit(client, page, metrics_map[u])
+            pages, stats = await crawl_site(
+                root_url.strip(),
+                max_pages=max_pages,
+                min_words=min_words,
+                include_thin=include_thin,
+            )
         except Exception as e:
-            audits[u] = {
-                "summary": "",
-                "top_issues": [f"LLMエラー: {e.__class__.__name__}"],
-                "recommendations": []
-            }
+            st.error(f"クロールエラー: {e.__class__.__name__}")
+            return {}, {}, {}
 
-    progress.progress(1.0, text="完了")
-    return metrics_map, audits, stats
+        if st.session_state.cancel:
+            return {}, {}, {}
 
+        # --- クロール結果サマリ ---
+        with st.expander("クロール内訳（診断）", expanded=True):
+            st.write({
+                "crawled": stats.get("crawled", 0),
+                "status_200_html": stats.get("status_200_html", 0),
+                "final_kept": stats.get("final_kept", 0),
+                "filtered_thin": stats.get("filtered_thin", 0),
+                "skipped_noindex": stats.get("skipped_noindex", 0),
+                "robots_denied": stats.get("robots_denied", 0),
+                "fetch_error": stats.get("fetch_error", 0),
+                "min_words": min_words,
+                "include_thin": include_thin,
+            })
+            fails = stats.get("fail_samples") or []
+            if fails:
+                st.markdown("**失敗サンプル（最大5件）**")
+                for f in fails:
+                    st.code(f, language="json")
+
+        if not pages:
+            progress.progress(1.0, text="完了")
+            return {}, {}, stats
+
+        # --- メトリクス計算 ---
+        progress.progress(0.4, text="メトリクス算出中…")
+        metrics_map = {u: compute_metrics(p) for u, p in pages.items()}
+
+        # --- LLM提案生成 ---
+        progress.progress(0.7, text="LLM提案生成中…")
+        audits = {}
+        total = len(pages)
+        for i, (u, page) in enumerate(pages.items(), start=1):
+            if st.session_state.cancel:
+                break
+            status_box.write(f"分析 {i}/{total}: {u}")
+            try:
+                audits[u] = page_audit(client, page, metrics_map[u])
+            except Exception as e:
+                audits[u] = {
+                    "summary": "",
+                    "top_issues": [f"LLMエラー: {e.__class__.__name__}"],
+                    "recommendations": [],
+                }
+
+        progress.progress(1.0, text="完了")
+        return metrics_map, audits, stats
 
     metrics_map, audits, stats = run_async(main())
     st.session_state.running = False
@@ -135,6 +138,7 @@ if start_btn:
         st.info("対象ページがありません。（語数条件や noindex/robots により除外された可能性があります）")
         st.stop()
 
+    # --- スコアテーブル ---
     st.subheader("ページ別スコア（SEO/UX）")
     rows = []
     for u, m in metrics_map.items():
@@ -153,6 +157,7 @@ if start_btn:
         })
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
+    # --- 詳細提案 ---
     st.subheader("詳細（提案）")
     for u in sorted(metrics_map.keys()):
         with st.expander(u, expanded=False):
@@ -173,6 +178,7 @@ if start_btn:
                 for it in a["recommendations"]:
                     st.write(f"- {it}")
 
+    # --- エクスポート ---
     st.subheader("エクスポート")
     bundle = {u: {"metrics": metrics_map[u], "audit": audits.get(u, {})} for u in metrics_map}
     buf = io.StringIO()
@@ -181,15 +187,10 @@ if start_btn:
                        file_name="audit_full.json", mime="application/json")
 
     csv_buf = io.StringIO()
-    fieldnames = ["URL","Title","SEO","UX","Words","Alt%","Links","LD+JSON","Viewport","MetaDesc","H1"]
+    fieldnames = ["URL", "Title", "SEO", "UX", "Words", "Alt%", "Links", "LD+JSON", "Viewport", "MetaDesc", "H1"]
     writer = csv.DictWriter(csv_buf, fieldnames=fieldnames)
     writer.writeheader()
     for r in rows:
         writer.writerow(r)
     st.download_button("CSV（スコア表）をダウンロード", data=csv_buf.getvalue(),
                        file_name="audit_scores.csv", mime="text/csv")
-
-
-
-
-
