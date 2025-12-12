@@ -1,62 +1,110 @@
-# crawler.py — crawl + rich extraction (meta/h1/links/img/ld+json/viewport)
-import asyncio, re
+# crawler.py — Secure crawler: SSRF guard, strict robots, size cap, rich extraction
+import asyncio, re, ipaddress, socket
 from urllib.parse import urljoin, urldefrag, urlparse
 import aiohttp
 import tldextract
 from bs4 import BeautifulSoup
+import urllib.robotparser as rp
 
 DEFAULT_DELAY = 0.75
 TIMEOUT = aiohttp.ClientTimeout(total=20, connect=5)
+MAX_BYTES = 4 * 1024 * 1024  # 4MB 上限
+UA = "WiseCrawler/1.0 (+https://wise-ag.com; contact: info@wise-ag.com)"
+
+def _is_private_ip(host: str) -> bool:
+    """DNS解決してプライベート/ループバック/リンクローカル/予約アドレスを弾く"""
+    try:
+        infos = socket.getaddrinfo(host, None)  # v4/v6 両方
+        for family, *_rest, sockaddr in infos:
+            ip = sockaddr[0]
+            ip_obj = ipaddress.ip_address(ip)
+            if (
+                ip_obj.is_private or ip_obj.is_loopback or
+                ip_obj.is_link_local or ip_obj.is_reserved or ip_obj.is_multicast
+            ):
+                return True
+    except Exception:
+        # 解決失敗は安全側に倒さない（正規サイトでも失敗し得るため）
+        return False
+    return False
 
 def normalize_url(base: str, href: str) -> str | None:
-    if not href: return None
+    if not href:
+        return None
     url = urljoin(base, href)
     url, _ = urldefrag(url)
     p = urlparse(url)
-    if not p.scheme.startswith("http"): return None
+    if p.scheme not in ("http", "https"):
+        return None
     # 同一ホストのみ
-    if urlparse(base).netloc != p.netloc: return None
+    base_host = urlparse(base).netloc
+    if p.netloc != base_host:
+        return None
+    # プライベートIPホストは拒否
+    host_only = p.hostname or ""
+    if _is_private_ip(host_only):
+        return None
     return url
 
 async def fetch_text(session: aiohttp.ClientSession, url: str):
+    """最大サイズ制限付きでHTMLを取得。最終リダイレクト先のホストが安全かも確認。"""
     try:
-        async with session.get(url, timeout=TIMEOUT, headers={"Accept-Encoding": "gzip, br"}) as r:
-            ct = r.headers.get("Content-Type","")
-            html = await r.text(errors="ignore") if (r.status == 200 and "text/html" in ct) else None
+        async with session.get(
+            url,
+            timeout=TIMEOUT,
+            headers={"Accept-Encoding": "gzip, br", "User-Agent": UA},
+            allow_redirects=True,
+        ) as r:
+            # リダイレクト後の最終URL検査（同一ホスト & パブリックIP）
+            final = str(r.url)
+            fp = urlparse(final)
+            if fp.netloc != urlparse(url).netloc or _is_private_ip(fp.hostname or ""):
+                return 451, None, {}
+            ct = r.headers.get("Content-Type", "")
+            if r.status == 200 and "text/html" in ct:
+                total = 0
+                chunks = []
+                async for chunk in r.aiter_bytes():
+                    total += len(chunk)
+                    if total > MAX_BYTES:
+                        break
+                    chunks.append(chunk)
+                html = b"".join(chunks).decode(errors="ignore") if chunks else None
+            else:
+                html = None
             return r.status, html, dict(r.headers)
     except Exception:
         return 0, None, {}
 
-def parse_robots(robots_txt: str):
-    disallows, crawl_delay = [], None
-    blocks = re.split(r'(?i)User-agent:\s*\*', robots_txt)
-    rules = blocks[-1] if len(blocks) > 1 else robots_txt
-    for line in rules.splitlines():
-        m = re.search(r'(?i)Disallow:\s*(\S+)', line)
-        if m: disallows.append(m.group(1).strip())
-        m2 = re.search(r'(?i)Crawl-delay:\s*([\d\.]+)', line)
-        if m2: crawl_delay = float(m2.group(1))
-    return disallows, crawl_delay
-
-async def get_robots_and_delay(session, base_url: str):
+async def get_robots(session, base_url: str):
+    """標準robotsパーサで厳格に判定"""
     base = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
-    status, txt, _ = await fetch_text(session, urljoin(base, "/robots.txt"))
-    disallows, crawl_delay = parse_robots(txt or "")
-    return disallows, crawl_delay if crawl_delay else DEFAULT_DELAY
+    robots_url = urljoin(base, "/robots.txt")
+    status, txt, _ = await fetch_text(session, robots_url)
+    parser = rp.RobotFileParser()
+    parser.set_url(robots_url)
+    parser.parse((txt or "").splitlines())
+    return parser
 
-def allowed(disallows: list[str], path: str) -> bool:
-    if not disallows: return True
-    return not any(path.startswith(d) for d in disallows if d and d != "/")
+def allowed(robots: rp.RobotFileParser, url: str) -> bool:
+    try:
+        return robots.can_fetch(UA, url)
+    except Exception:
+        return True
 
 def _strip_nav(soup: BeautifulSoup):
-    for sel in ["nav", "footer", "header", "[role=navigation]", ".menu", ".sidebar", ".cookie", ".advert"]:
+    for sel in [
+        "nav", "footer", "header", "[role=navigation]", ".menu", ".sidebar",
+        ".cookie", ".advert", ".ad", ".ads", ".banner"
+    ]:
         for t in soup.select(sel):
             t.decompose()
 
 def extract_rich(url: str, html: str):
     soup = BeautifulSoup(html, "html.parser")
+
     # meta robots
-    robots_tag = soup.find("meta", attrs={"name": lambda x: x and x.lower()=="robots"})
+    robots_tag = soup.find("meta", attrs={"name": lambda x: x and x.lower() == "robots"})
     if robots_tag:
         content = (robots_tag.get("content") or "").lower()
         if "noindex" in content or "nofollow" in content:
@@ -72,17 +120,20 @@ def extract_rich(url: str, html: str):
     title = title_tag.get_text(strip=True) if title_tag else ""
 
     md = ""
-    md_tag = soup.find("meta", attrs={"name": lambda x: x and x.lower()=="description"})
-    if md_tag: md = md_tag.get("content") or ""
+    md_tag = soup.find("meta", attrs={"name": lambda x: x and x.lower() == "description"})
+    if md_tag:
+        md = md_tag.get("content") or ""
 
     h1 = ""
     h1_tag = soup.find("h1")
-    if h1_tag: h1 = h1_tag.get_text(" ", strip=True)
+    if h1_tag:
+        h1 = h1_tag.get_text(" ", strip=True)
 
     # viewport
     viewport = ""
-    vp_tag = soup.find("meta", attrs={"name": lambda x: x and x.lower()=="viewport"})
-    if vp_tag: viewport = vp_tag.get("content") or ""
+    vp_tag = soup.find("meta", attrs={"name": lambda x: x and x.lower() == "viewport"})
+    if vp_tag:
+        viewport = vp_tag.get("content") or ""
 
     # ld+json
     has_ldjson = bool(soup.find("script", attrs={"type": "application/ld+json"}))
@@ -99,7 +150,8 @@ def extract_rich(url: str, html: str):
     links = set()
     for a in soup.find_all("a", href=True):
         nu = normalize_url(url, a["href"])
-        if nu: links.add(nu)
+        if nu:
+            links.add(nu)
 
     # word/para count（簡易）
     words = len(re.findall(r"\w+", text))
@@ -138,15 +190,22 @@ async def crawl_site(root_url: str, max_pages=50):
     limiter = DomainLimiter(concurrency=2)
 
     async with aiohttp.ClientSession() as session:
-        disallows, delay = await get_robots_and_delay(session, root_url)
+        robots = await get_robots(session, root_url)
 
         async def worker():
             while queue and len(results) < max_pages:
                 url = queue.pop(0)
-                path = urlparse(url).path or "/"
-                if not allowed(disallows, path):
+
+                # robots判定（フルURLで判定）
+                if not allowed(robots, url):
                     results[url] = {"status": 451, "url": url}
                     continue
+
+                # プライベートIP対策（念のため二重チェック）
+                if _is_private_ip(urlparse(url).hostname or ""):
+                    results[url] = {"status": 451, "url": url}
+                    continue
+
                 sem = limiter.sem(url)
                 async with sem:
                     status, html, _ = await fetch_text(session, url)
@@ -162,7 +221,7 @@ async def crawl_site(root_url: str, max_pages=50):
                                 if link not in visited and len(results) + len(queue) < max_pages:
                                     visited.add(link)
                                     queue.append(link)
-                await asyncio.sleep(delay)
+                await asyncio.sleep(DEFAULT_DELAY)
 
         workers = [asyncio.create_task(worker()) for _ in range(4)]
         await asyncio.gather(*workers)
