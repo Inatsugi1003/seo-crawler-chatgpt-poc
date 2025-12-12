@@ -1,4 +1,4 @@
-# app.py — crawl -> metrics -> LLM suggestions -> dashboard
+# app.py — crawl -> metrics -> LLM suggestions -> dashboard (secure edition)
 import asyncio, json, io, csv
 import streamlit as st
 from secure_openai_client import get_openai_client
@@ -9,7 +9,7 @@ from llm import page_audit
 st.set_page_config(page_title="Site Crawl & Audit (Safe)", page_icon="🕸️")
 st.title("サイト自動クロール × ChatGPT分析（安全実装・拡張版）")
 
-# 起動時にOpenAIだけ先に作って疎通確認（軽量）
+# 起動時：OpenAI疎通（軽量）
 client = get_openai_client()
 try:
     _ = client.models.list()
@@ -73,9 +73,7 @@ if start_btn:
 
         # メトリクス計算
         progress.progress(0.4, text="メトリクス算出中…")
-        metrics_map = {}
-        for u, page in pages.items():
-            metrics_map[u] = compute_metrics(page)
+        metrics_map = {u: compute_metrics(p) for u, p in pages.items()}
 
         # LLM提案
         progress.progress(0.7, text="LLM提案生成中…")
@@ -132,7 +130,7 @@ if start_btn:
             st.markdown(f"**Title:** {m.get('title','')}")
             st.markdown(f"- SEO: {m.get('seo_score')} / UX: {m.get('ux_score')}")
             st.markdown(f"- Words: {m.get('word_count')}  Links: {m.get('internal_links')}  Alt%: {m.get('images_alt_ratio')}")
-            st.markdown(f"- LD+JSON: {'Yes' if m.get('has_ldjson') else 'No'} / Viewport: {'Yes' if m.get('has_viewport') else 'No'}")
+            st.markdown(f"- LD+JSON: {'Yes' if m.get('has_ldjson') else 'No'} / Viewport: {'Yes' if m.get('has_viewport') else 'No'} / MetaDesc: {'Yes' if m.get('has_meta_description') else 'No'} / H1: {'Yes' if m.get('has_h1') else 'No'}")
             if a.get("summary"):
                 st.markdown(f"**Summary:** {a['summary']}")
             if a.get("top_issues"):
@@ -147,12 +145,7 @@ if start_btn:
     # ===== エクスポート =====
     st.subheader("エクスポート")
     # JSON
-    bundle = {}
-    for u in metrics_map:
-        bundle[u] = {
-            "metrics": metrics_map[u],
-            "audit": audits.get(u, {})
-        }
+    bundle = {u: {"metrics": metrics_map[u], "audit": audits.get(u, {})} for u in metrics_map}
     buf = io.StringIO()
     json.dump(bundle, buf, ensure_ascii=False, indent=2)
     st.download_button("JSON（全件）をダウンロード", data=buf.getvalue(),
