@@ -99,6 +99,7 @@ if start_btn:
             st.code(f, language="json")
 
 
+
         if not pages:
             progress.progress(1.0, text="完了")
             return {}, {}, stats
@@ -187,6 +188,7 @@ if start_btn:
         writer.writerow(r)
     st.download_button("CSV（スコア表）をダウンロード", data=csv_buf.getvalue(),
                        file_name="audit_scores.csv", mime="text/csv")
+
 
 
 
