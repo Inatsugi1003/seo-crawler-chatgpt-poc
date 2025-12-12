@@ -6,29 +6,45 @@ import tldextract
 from bs4 import BeautifulSoup
 import urllib.robotparser as rp
 
-DEFAULT_DELAY = 0.75
+# ===== Tunables =====
+DEFAULT_DELAY = 1.5  # WAF/レート制限に優しいデフォルト
 TIMEOUT = aiohttp.ClientTimeout(total=20, connect=5)
 MAX_BYTES = 4 * 1024 * 1024  # 4MB 上限
 
-# 中立のUA（誤認防止）
-UA = "SiteAuditBot/1.0 (+https://github.com/inatsugi1003; contact: example@example.com)"
+# 中立・安全なUA（必要なら書き換えてOK）
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+)
+# 例）自作識別子にしたい場合：
+# UA = "SiteAuditBot/1.0 (+https://github.com/your-id; contact: you@example.com)"
 
+# ===== Helpers =====
 def _is_private_ip(host: str) -> bool:
+    """DNS解決してプライベート/ループバック等なら True"""
     try:
         infos = socket.getaddrinfo(host, None)
-        for family, *_rest, sockaddr in infos:
+        for _, _, _, _, sockaddr in infos:
             ip = sockaddr[0]
             ip_obj = ipaddress.ip_address(ip)
             if (
-                ip_obj.is_private or ip_obj.is_loopback or
-                ip_obj.is_link_local or ip_obj.is_reserved or ip_obj.is_multicast
+                ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
+                or ip_obj.is_reserved or ip_obj.is_multicast
             ):
                 return True
     except Exception:
         return False
     return False
 
+def _etld1(host: str) -> str:
+    """example.com / hatenablog.com など eTLD+1 を返す"""
+    if not host:
+        return ""
+    t = tldextract.extract(host)
+    return f"{t.domain}.{t.suffix}"
+
 def normalize_url(base: str, href: str) -> str | None:
+    """同一 eTLD+1 内リンクのみ許可し、プライベートIPを拒否"""
     if not href:
         return None
     url = urljoin(base, href)
@@ -36,18 +52,23 @@ def normalize_url(base: str, href: str) -> str | None:
     p = urlparse(url)
     if p.scheme not in ("http", "https"):
         return None
-    # 同一ホストのみ
-    base_host = urlparse(base).netloc
-    if p.netloc != base_host:
+
+    base_host = urlparse(base).hostname or ""
+    host = p.hostname or ""
+    # eTLD+1が同じ（例：example.com内）ならOK
+    if _etld1(base_host) != _etld1(host):
         return None
-    # プライベートIP拒否
-    host_only = p.hostname or ""
-    if _is_private_ip(host_only):
+    if _is_private_ip(host):
         return None
     return url
 
 async def fetch_text(session: aiohttp.ClientSession, url: str):
-    """最大サイズ制限付きでHTML取得。リダイレクト最終URLも検査。"""
+    """
+    最大サイズ制限付きでHTML取得。リダイレクト先が
+    1) 同一 eTLD+1 内 かつ
+    2) 非プライベートIP
+    でない場合は拒否。
+    """
     try:
         async with session.get(
             url,
@@ -64,9 +85,14 @@ async def fetch_text(session: aiohttp.ClientSession, url: str):
         ) as r:
             final = str(r.url)
             fp = urlparse(final)
-            # リダイレクトで別ホスト/プライベートへ飛ぶのを拒否
-            if fp.netloc != urlparse(url).netloc or _is_private_ip(fp.hostname or ""):
-                return 451, None, {"Final-URL": final, "Reason": "host_changed_or_private"}
+            orig_host = urlparse(url).hostname or ""
+            final_host = fp.hostname or ""
+
+            # eTLD+1外 or プライベートIP は拒否
+            if _etld1(orig_host) != _etld1(final_host) or _is_private_ip(final_host):
+                return 451, None, {
+                    "Final-URL": final, "Reason": "host_changed_outside_etld1_or_private"
+                }
 
             ct = (r.headers.get("Content-Type") or "").lower()
             is_html = ("text/html" in ct) or ("application/xhtml+xml" in ct)
@@ -116,7 +142,7 @@ def _strip_nav(soup: BeautifulSoup):
 def extract_rich(url: str, html: str):
     soup = BeautifulSoup(html, "html.parser")
 
-    # meta robots
+    # meta robots noindex/nofollow
     robots_tag = soup.find("meta", attrs={"name": lambda x: x and x.lower() == "robots"})
     if robots_tag:
         content = (robots_tag.get("content") or "").lower()
@@ -148,13 +174,14 @@ def extract_rich(url: str, html: str):
 
     has_ldjson = bool(soup.find("script", attrs={"type": "application/ld+json"}))
 
-    img_nodes = soup.find_all("img")
+    # 画像とalt
     imgs = []
-    for im in img_nodes:
+    for im in soup.find_all("img"):
         src = im.get("src") or ""
         alt = im.get("alt") or ""
         imgs.append({"src": src, "alt": alt})
 
+    # 内部リンク（同一 eTLD+1 内）
     links = set()
     for a in soup.find_all("a", href=True):
         nu = normalize_url(url, a["href"])
@@ -191,13 +218,15 @@ class DomainLimiter:
             self._sems[domain] = asyncio.Semaphore(self._conc)
         return self._sems[domain]
 
+# ===== Public API =====
 async def crawl_site(root_url: str, max_pages=50, min_words=400, include_thin=False):
     """
-    return: (final_pages: dict[url->rich], stats: dict)
-    stats にはスキップ理由の内訳を格納
+    Returns:
+      final_pages: dict[url -> rich_page_dict]
+      stats: dict (counters + 'fail_samples' for debugging)
     """
     visited, queue = set([root_url]), [root_url]
-    results = {}  # url -> rich or status
+    results = {}
     stats = {
         "crawled": 0,
         "final_kept": 0,
@@ -206,7 +235,7 @@ async def crawl_site(root_url: str, max_pages=50, min_words=400, include_thin=Fa
         "robots_denied": 0,
         "fetch_error": 0,
         "status_200_html": 0,
-        "fail_samples": [],   # 失敗理由のサンプル（最大5件）
+        "fail_samples": [],  # 最大5件
     }
     limiter = DomainLimiter(concurrency=2)
 
@@ -218,13 +247,13 @@ async def crawl_site(root_url: str, max_pages=50, min_words=400, include_thin=Fa
             while queue and len(results) < max_pages:
                 url = queue.pop(0)
 
-                # robots判定（フルURL）
+                # robots 判定（フルURL）
                 if not allowed(robots, url):
                     results[url] = {"status": 451, "url": url}
                     stats["robots_denied"] += 1
                     continue
 
-                # プライベートIP対策
+                # プライベートIP対策（念のため）
                 if _is_private_ip(urlparse(url).hostname or ""):
                     results[url] = {"status": 451, "url": url}
                     stats["robots_denied"] += 1
