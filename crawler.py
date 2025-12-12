@@ -1,4 +1,4 @@
-# crawler.py — Secure crawler: SSRF guard, strict robots, size cap, rich extraction
+# crawler.py — Secure crawler: SSRF guard, strict robots, size cap, rich extraction + stats
 import asyncio, re, ipaddress, socket
 from urllib.parse import urljoin, urldefrag, urlparse
 import aiohttp
@@ -12,9 +12,8 @@ MAX_BYTES = 4 * 1024 * 1024  # 4MB 上限
 UA = "WiseCrawler/1.0 (+https://wise-ag.com; contact: info@wise-ag.com)"
 
 def _is_private_ip(host: str) -> bool:
-    """DNS解決してプライベート/ループバック/リンクローカル/予約アドレスを弾く"""
     try:
-        infos = socket.getaddrinfo(host, None)  # v4/v6 両方
+        infos = socket.getaddrinfo(host, None)
         for family, *_rest, sockaddr in infos:
             ip = sockaddr[0]
             ip_obj = ipaddress.ip_address(ip)
@@ -24,7 +23,6 @@ def _is_private_ip(host: str) -> bool:
             ):
                 return True
     except Exception:
-        # 解決失敗は安全側に倒さない（正規サイトでも失敗し得るため）
         return False
     return False
 
@@ -36,18 +34,15 @@ def normalize_url(base: str, href: str) -> str | None:
     p = urlparse(url)
     if p.scheme not in ("http", "https"):
         return None
-    # 同一ホストのみ
     base_host = urlparse(base).netloc
     if p.netloc != base_host:
         return None
-    # プライベートIPホストは拒否
     host_only = p.hostname or ""
     if _is_private_ip(host_only):
         return None
     return url
 
 async def fetch_text(session: aiohttp.ClientSession, url: str):
-    """最大サイズ制限付きでHTMLを取得。最終リダイレクト先のホストが安全かも確認。"""
     try:
         async with session.get(
             url,
@@ -55,11 +50,10 @@ async def fetch_text(session: aiohttp.ClientSession, url: str):
             headers={"Accept-Encoding": "gzip, br", "User-Agent": UA},
             allow_redirects=True,
         ) as r:
-            # リダイレクト後の最終URL検査（同一ホスト & パブリックIP）
             final = str(r.url)
             fp = urlparse(final)
             if fp.netloc != urlparse(url).netloc or _is_private_ip(fp.hostname or ""):
-                return 451, None, {}
+                return 451, None, {"Final-URL": final}
             ct = r.headers.get("Content-Type", "")
             if r.status == 200 and "text/html" in ct:
                 total = 0
@@ -72,12 +66,13 @@ async def fetch_text(session: aiohttp.ClientSession, url: str):
                 html = b"".join(chunks).decode(errors="ignore") if chunks else None
             else:
                 html = None
-            return r.status, html, dict(r.headers)
+            headers = dict(r.headers)
+            headers["Final-URL"] = final
+            return r.status, html, headers
     except Exception:
         return 0, None, {}
 
 async def get_robots(session, base_url: str):
-    """標準robotsパーサで厳格に判定"""
     base = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
     robots_url = urljoin(base, "/robots.txt")
     status, txt, _ = await fetch_text(session, robots_url)
@@ -103,14 +98,12 @@ def _strip_nav(soup: BeautifulSoup):
 def extract_rich(url: str, html: str):
     soup = BeautifulSoup(html, "html.parser")
 
-    # meta robots
     robots_tag = soup.find("meta", attrs={"name": lambda x: x and x.lower() == "robots"})
     if robots_tag:
         content = (robots_tag.get("content") or "").lower()
         if "noindex" in content or "nofollow" in content:
             return {"skip_by_meta": True}
 
-    # remove nav/footer before text extraction
     _strip_nav(soup)
     main = soup.find("main") or soup.find("article") or soup.body or soup
     text = (main.get_text("\n", strip=True) if main else soup.get_text("\n", strip=True))
@@ -129,16 +122,13 @@ def extract_rich(url: str, html: str):
     if h1_tag:
         h1 = h1_tag.get_text(" ", strip=True)
 
-    # viewport
     viewport = ""
     vp_tag = soup.find("meta", attrs={"name": lambda x: x and x.lower() == "viewport"})
     if vp_tag:
         viewport = vp_tag.get("content") or ""
 
-    # ld+json
     has_ldjson = bool(soup.find("script", attrs={"type": "application/ld+json"}))
 
-    # images (alt)
     img_nodes = soup.find_all("img")
     imgs = []
     for im in img_nodes:
@@ -146,14 +136,12 @@ def extract_rich(url: str, html: str):
         alt = im.get("alt") or ""
         imgs.append({"src": src, "alt": alt})
 
-    # internal links
     links = set()
     for a in soup.find_all("a", href=True):
         nu = normalize_url(url, a["href"])
         if nu:
             links.add(nu)
 
-    # word/para count（簡易）
     words = len(re.findall(r"\w+", text))
     paras = len([p for p in text.split("\n\n") if p.strip()])
 
@@ -166,8 +154,8 @@ def extract_rich(url: str, html: str):
         "h1": h1,
         "viewport": viewport,
         "has_ldjson": has_ldjson,
-        "images": imgs,                 # [{src, alt}]
-        "links": list(links),           # internal only
+        "images": imgs,
+        "links": list(links),
         "text": text,
         "word_count": words,
         "para_count": paras,
@@ -184,37 +172,58 @@ class DomainLimiter:
             self._sems[domain] = asyncio.Semaphore(self._conc)
         return self._sems[domain]
 
-async def crawl_site(root_url: str, max_pages=50):
+async def crawl_site(root_url: str, max_pages=50, min_words=400, include_thin=False):
+    """
+    return: (final_pages: dict[url->rich], stats: dict)
+    stats にはスキップ理由の内訳を格納
+    """
     visited, queue = set([root_url]), [root_url]
-    results = {}  # url -> rich dict
+    results = {}  # url -> rich or status
+    stats = {
+        "crawled": 0,
+        "final_kept": 0,
+        "filtered_thin": 0,
+        "skipped_noindex": 0,
+        "robots_denied": 0,
+        "fetch_error": 0,
+        "status_200_html": 0,
+    }
     limiter = DomainLimiter(concurrency=2)
 
     async with aiohttp.ClientSession() as session:
         robots = await get_robots(session, root_url)
 
         async def worker():
+            nonlocal stats
             while queue and len(results) < max_pages:
                 url = queue.pop(0)
 
-                # robots判定（フルURLで判定）
                 if not allowed(robots, url):
                     results[url] = {"status": 451, "url": url}
+                    stats["robots_denied"] += 1
                     continue
 
-                # プライベートIP対策（念のため二重チェック）
                 if _is_private_ip(urlparse(url).hostname or ""):
                     results[url] = {"status": 451, "url": url}
+                    stats["robots_denied"] += 1
                     continue
 
                 sem = limiter.sem(url)
                 async with sem:
                     status, html, _ = await fetch_text(session, url)
+                    stats["crawled"] += 1
                     if status != 200 or not html:
                         results[url] = {"status": status, "url": url}
+                        if status == 200:
+                            stats["fetch_error"] += 1
+                        else:
+                            stats["fetch_error"] += 1
                     else:
+                        stats["status_200_html"] += 1
                         rich = extract_rich(url, html)
                         if rich.get("skip_by_meta"):
                             results[url] = {"status": 200, "url": url, "skipped": True}
+                            stats["skipped_noindex"] += 1
                         else:
                             results[url] = rich
                             for link in rich.get("links", []):
@@ -226,9 +235,12 @@ async def crawl_site(root_url: str, max_pages=50):
         workers = [asyncio.create_task(worker()) for _ in range(4)]
         await asyncio.gather(*workers)
 
-    # 薄いページ除外（例：本文400語未満）
     final = {}
     for u, v in results.items():
-        if v.get("status") == 200 and not v.get("skipped") and v.get("word_count", 0) >= 400:
-            final[u] = v
-    return final
+        if v.get("status") == 200 and not v.get("skipped"):
+            if include_thin or (v.get("word_count", 0) >= min_words):
+                final[u] = v
+                stats["final_kept"] += 1
+            else:
+                stats["filtered_thin"] += 1
+    return final, stats
