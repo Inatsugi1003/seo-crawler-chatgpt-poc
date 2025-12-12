@@ -80,19 +80,24 @@ if start_btn:
         if st.session_state.cancel:
             return {}, {}, {}
 
-        # 内訳を先に表示
         with st.expander("クロール内訳（診断）", expanded=True):
-            st.write({
-                "crawled": stats.get("crawled", 0),
-                "status_200_html": stats.get("status_200_html", 0),
-                "final_kept": stats.get("final_kept", 0),
-                "filtered_thin": stats.get("filtered_thin", 0),
-                "skipped_noindex": stats.get("skipped_noindex", 0),
-                "robots_denied": stats.get("robots_denied", 0),
-                "fetch_error": stats.get("fetch_error", 0),
-                "min_words": min_words,
-                "include_thin": include_thin,
-            })
+    st.write({
+        "crawled": stats.get("crawled", 0),
+        "status_200_html": stats.get("status_200_html", 0),
+        "final_kept": stats.get("final_kept", 0),
+        "filtered_thin": stats.get("filtered_thin", 0),
+        "skipped_noindex": stats.get("skipped_noindex", 0),
+        "robots_denied": stats.get("robots_denied", 0),
+        "fetch_error": stats.get("fetch_error", 0),
+        "min_words": min_words,
+        "include_thin": include_thin,
+    })
+    fails = stats.get("fail_samples") or []
+    if fails:
+        st.markdown("**失敗サンプル（最大5件）**")
+        for f in fails:
+            st.code(f, language="json")
+
 
         if not pages:
             progress.progress(1.0, text="完了")
@@ -182,3 +187,4 @@ if start_btn:
         writer.writerow(r)
     st.download_button("CSV（スコア表）をダウンロード", data=csv_buf.getvalue(),
                        file_name="audit_scores.csv", mime="text/csv")
+
