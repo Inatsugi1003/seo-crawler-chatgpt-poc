@@ -64,57 +64,68 @@ def normalize_url(base: str, href: str) -> str | None:
 
 async def fetch_text(session: aiohttp.ClientSession, url: str):
     """
-    最大サイズ制限付きでHTML取得。リダイレクト先が
-    1) 同一 eTLD+1 内 かつ
-    2) 非プライベートIP
-    でない場合は拒否。
+    最大サイズ制限付きでHTML取得。WAF/CDN耐性を強化。
     """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Connection": "keep-alive",
+    }
+
     try:
-        async with session.get(
-            url,
-            timeout=TIMEOUT,
-            headers={
-                "User-Agent": UA,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-                "Accept-Encoding": "gzip, br",
-                "Connection": "keep-alive",
-                "Cache-Control": "no-cache",
-            },
-            allow_redirects=True,
-        ) as r:
-            final = str(r.url)
-            fp = urlparse(final)
-            orig_host = urlparse(url).hostname or ""
-            final_host = fp.hostname or ""
+        for attempt in range(3):  # 最大3回リトライ
+            async with session.get(
+                url,
+                timeout=TIMEOUT,
+                headers=headers,
+                allow_redirects=True,
+                ssl=False  # SSL検証を緩める（自己署名やTLS差異対策）
+            ) as r:
+                final = str(r.url)
+                fp = urlparse(final)
+                orig_host = urlparse(url).hostname or ""
+                final_host = fp.hostname or ""
 
-            # eTLD+1外 or プライベートIP は拒否
-            if _etld1(orig_host) != _etld1(final_host) or _is_private_ip(final_host):
-                return 451, None, {
-                    "Final-URL": final, "Reason": "host_changed_outside_etld1_or_private"
-                }
+                # eTLD+1外 or プライベートIP は拒否
+                if _etld1(orig_host) != _etld1(final_host) or _is_private_ip(final_host):
+                    return 451, None, {
+                        "Final-URL": final,
+                        "Reason": "host_changed_outside_etld1_or_private"
+                    }
 
-            ct = (r.headers.get("Content-Type") or "").lower()
-            is_html = ("text/html" in ct) or ("application/xhtml+xml" in ct)
+                ct = (r.headers.get("Content-Type") or "").lower()
+                is_html = ("text/html" in ct) or ("application/xhtml+xml" in ct)
 
-            html = None
-            if r.status == 200 and is_html:
-                total = 0
-                chunks = []
-                async for chunk in r.aiter_bytes():
-                    total += len(chunk)
-                    if total > MAX_BYTES:
-                        break
-                    chunks.append(chunk)
-                html = b"".join(chunks).decode(errors="ignore") if chunks else None
+                html = None
+                if r.status == 200 and is_html:
+                    total = 0
+                    chunks = []
+                    async for chunk in r.aiter_bytes():
+                        total += len(chunk)
+                        if total > MAX_BYTES:
+                            break
+                        chunks.append(chunk)
+                    html = b"".join(chunks).decode(errors="ignore") if chunks else None
 
-            headers = dict(r.headers)
-            headers["Final-URL"] = final
-            headers["__status"] = str(r.status)
-            headers["__is_html"] = str(bool(is_html))
-            return r.status, html, headers
+                headers_out = dict(r.headers)
+                headers_out["Final-URL"] = final
+                headers_out["__status"] = str(r.status)
+                headers_out["__is_html"] = str(bool(is_html))
+                if html:
+                    return r.status, html, headers_out
+
+            await asyncio.sleep(1.5)  # 少し待って再試行
+        return 0, None, {"__exc": "MaxRetryExceeded"}
     except Exception as e:
         return 0, None, {"__exc": e.__class__.__name__}
+
 
 async def get_robots(session, base_url: str):
     base = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
@@ -302,3 +313,4 @@ async def crawl_site(root_url: str, max_pages=50, min_words=400, include_thin=Fa
             else:
                 stats["filtered_thin"] += 1
     return final, stats
+
